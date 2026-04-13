@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="WarButBetterBackend/WarButBetterBackend.csproj" />
+  <Project Path="WarButBetterDemoConsole/WarButBetterDemoConsole.csproj" />
+  <Project Path="WarButBetterTests/WarButBetterTests.csproj" />
+</Solution>
