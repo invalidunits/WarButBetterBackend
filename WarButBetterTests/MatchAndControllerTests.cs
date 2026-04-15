@@ -2,16 +2,20 @@ using System.Net.WebSockets;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging.Abstractions;
 using WarButBetterBackend;
 
 namespace WarButBetterTests;
 
 public class MatchTests
 {
+    private static Match CreateMatch() => new(Guid.NewGuid());
+    private static ClientSession CreateSession() => new(new FakeClosedWebSocket(), NullLogger<ClientSession>.Instance);
+
     [Fact]
     public void NewMatch_StartsInWaitingForPlayersState()
     {
-        var match = new Match();
+        var match = CreateMatch();
 
         Assert.Equal(Match.MatchState.WaitingForPlayers, match.State);
     }
@@ -19,11 +23,11 @@ public class MatchTests
     [Fact]
     public void AddClient_AsPlayer_AllowsOnlyTwoPlayers()
     {
-        var match = new Match();
+        var match = CreateMatch();
 
-        using var firstPlayer = new ClientSession(new FakeClosedWebSocket());
-        using var secondPlayer = new ClientSession(new FakeClosedWebSocket());
-        using var thirdPlayer = new ClientSession(new FakeClosedWebSocket());
+        using var firstPlayer = CreateSession();
+        using var secondPlayer = CreateSession();
+        using var thirdPlayer = CreateSession();
 
         match.AddClient(firstPlayer, AsPlayer: true);
         match.AddClient(secondPlayer, AsPlayer: true);
@@ -35,11 +39,11 @@ public class MatchTests
     [Fact]
     public void RemoveClient_FreesPlayerSlot()
     {
-        var match = new Match();
+        var match = CreateMatch();
 
-        using var firstPlayer = new ClientSession(new FakeClosedWebSocket());
-        using var secondPlayer = new ClientSession(new FakeClosedWebSocket());
-        using var replacementPlayer = new ClientSession(new FakeClosedWebSocket());
+        using var firstPlayer = CreateSession();
+        using var secondPlayer = CreateSession();
+        using var replacementPlayer = CreateSession();
 
         match.AddClient(firstPlayer, AsPlayer: true);
         match.AddClient(secondPlayer, AsPlayer: true);
@@ -53,12 +57,17 @@ public class MatchTests
 
 public class MatchmakingControllerTests
 {
+    private static MatchmakingController CreateController() =>
+        new(NullLogger<MatchmakingController>.Instance, NullLogger<ClientSession>.Instance);
+
+    private static Match CreateMatch() => new(Guid.NewGuid());
+
     [Fact]
     public void ListMatches_ReturnsExistingMatchIds()
     {
-        var controller = new MatchmakingController();
+        var controller = CreateController();
         var expectedId = Guid.NewGuid();
-        controller.Matches[expectedId] = new Match();
+        controller.Matches[expectedId] = CreateMatch();
 
         var result = controller.ListMatches();
 
@@ -70,7 +79,7 @@ public class MatchmakingControllerTests
     [Fact]
     public void CreateMatch_ReturnsGuidAndStoresMatch()
     {
-        var controller = new MatchmakingController();
+        var controller = CreateController();
 
         var result = controller.CreateMatch();
 
@@ -82,12 +91,10 @@ public class MatchmakingControllerTests
     [Fact]
     public async Task WaitForMatch_WhenNotWebSocket_ReturnsBadRequest()
     {
-        var controller = new MatchmakingController
+        var controller = CreateController();
+        controller.ControllerContext = new ControllerContext
         {
-            ControllerContext = new ControllerContext
-            {
-                HttpContext = new DefaultHttpContext()
-            }
+            HttpContext = new DefaultHttpContext()
         };
 
         var result = await controller.WaitForMatch();
@@ -99,12 +106,10 @@ public class MatchmakingControllerTests
     [Fact]
     public async Task Connect_WhenMatchNotFound_ReturnsNotFound()
     {
-        var controller = new MatchmakingController
+        var controller = CreateController();
+        controller.ControllerContext = new ControllerContext
         {
-            ControllerContext = new ControllerContext
-            {
-                HttpContext = new DefaultHttpContext()
-            }
+            HttpContext = new DefaultHttpContext()
         };
 
         var result = await controller.Connect(Guid.NewGuid(), spectate: false);
@@ -115,9 +120,9 @@ public class MatchmakingControllerTests
     [Fact]
     public async Task Connect_WhenNotWebSocketRequest_ReturnsBadRequestAnd400()
     {
-        var controller = new MatchmakingController();
+        var controller = CreateController();
         var matchId = Guid.NewGuid();
-        controller.Matches[matchId] = new Match();
+        controller.Matches[matchId] = CreateMatch();
 
         controller.ControllerContext = new ControllerContext
         {
@@ -128,16 +133,18 @@ public class MatchmakingControllerTests
 
         var badRequest = Assert.IsType<BadRequestObjectResult>(result);
         Assert.Equal("Must be a websocket request", badRequest.Value);
-        Assert.Equal(StatusCodes.Status400BadRequest, controller.HttpContext.Response.StatusCode);
+        Assert.Equal(StatusCodes.Status400BadRequest, badRequest.StatusCode);
     }
 }
 
 public class MatchRoundHistorySerializationTests
 {
+    private static Match CreateMatch() => new(Guid.NewGuid());
+
     [Fact]
     public void GetRoundHistory_NewMatch_IsEmpty()
     {
-        var match = new Match();
+        var match = CreateMatch();
 
         var history = match.GetRoundHistory();
 
@@ -160,7 +167,7 @@ public class MatchRoundHistorySerializationTests
                     Description = "Player 1 chose index 2 from top-five and moved card 17 to top of deck (effect of captured 3).",
                     SourcePlayer = 1,
                     TargetPlayers = new [] { 1 },
-                    Data = new Dictionary<string, string>
+                    Data = new ()
                     {
                         ["selectedIndex"] = "2",
                         ["chosenCard"] = "17",
@@ -193,6 +200,76 @@ public class MatchRoundHistorySerializationTests
         Assert.Equal(1, firstEvent.GetProperty("SourcePlayer").GetInt32());
 
         Assert.False(root.TryGetProperty("Events", out _));
+    }
+}
+
+public class MatchBattleRuleTests
+{
+    private static Match CreateMatch() => new(Guid.NewGuid());
+
+    [Fact]
+    public void DetermineWinner_AceVsNumber_AceCapturesInNormalRound()
+    {
+        var match = CreateMatch();
+        byte ace = CardExtensions.GetCard(CardExtensions.Suite.Heart, 14);
+        byte nine = CardExtensions.GetCard(CardExtensions.Suite.Spade, 9);
+
+        object outcome = InvokeDetermineWinner(match, ace, nine, warMode: false);
+
+        Assert.Equal("Player0Capture", outcome.ToString());
+    }
+
+    [Fact]
+    public void DetermineWinner_JokerStillBurns()
+    {
+        var match = CreateMatch();
+        byte joker = CardExtensions.GetCard(CardExtensions.Suite.Jester, 0);
+        byte ace = CardExtensions.GetCard(CardExtensions.Suite.Heart, 14);
+
+        object outcome = InvokeDetermineWinner(match, joker, ace, warMode: false);
+
+        Assert.Equal("JokerBurn", outcome.ToString());
+    }
+
+    [Fact]
+    public async Task QueueCardEffects_AceVsFour_AppliesOpposingCardEffect()
+    {
+        var match = CreateMatch();
+        byte ace = CardExtensions.GetCard(CardExtensions.Suite.Heart, 14);
+        byte four = CardExtensions.GetCard(CardExtensions.Suite.Spade, 4);
+        var ctx = new Match.RoundContext
+        {
+            Turn = 1,
+            Played = [ace, four],
+            Pile = [ace, four],
+            AppliedEvents = [],
+            EffectsDisabled = false,
+            OutcomeCode = 0,
+            Winner = 0,
+            RemainingCards = [26, 26],
+            BurnedCardsTotal = 0,
+        };
+
+        var queueMethod = typeof(Match).GetMethod("QueueCardEffects", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(queueMethod);
+        queueMethod!.Invoke(match, [ctx]);
+
+        var applyMethod = typeof(Match).GetMethod("ApplyQueuedEffects", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(applyMethod);
+        Task applyTask = Assert.IsAssignableFrom<Task>(applyMethod!.Invoke(match, [ctx]));
+        await applyTask;
+
+        Assert.Contains(ctx.AppliedEvents, e => e.EventType == "four_shuffle_opponent_deck");
+    }
+
+    private static object InvokeDetermineWinner(Match match, byte player0Card, byte player1Card, bool warMode)
+    {
+        var method = typeof(Match).GetMethod("DetermineWinner", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(method);
+
+        object? outcome = method!.Invoke(match, [player0Card, player1Card, warMode]);
+        Assert.NotNull(outcome);
+        return outcome!;
     }
 }
 

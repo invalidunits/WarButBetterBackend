@@ -4,6 +4,63 @@ namespace WarButBetterBackend
 
     public partial class Match
     {
+        private sealed class RandomJokerInjectionEvent : IRoundEvent
+        {
+            private readonly Match _match;
+            private readonly RoundContext _context;
+            private readonly List<int> _players = [];
+            private readonly List<int> _insertIndexes = [];
+
+            public RandomJokerInjectionEvent(Match match, RoundContext context)
+            {
+                _match = match;
+                _context = context;
+            }
+
+            public bool InjectedAny => _players.Count > 0;
+
+            public Task RecieveUserChoice() => Task.CompletedTask;
+
+            public string DescribeEvent()
+            {
+                if (!InjectedAny) return "";
+                return $"A distant laugh echos from beyond.";
+            }
+
+            public Task ApplyEvent()
+            {
+                Card joker = CardExtensions.GetCard(CardExtensions.Suite.Jester, 0);
+                double chance = Math.Min(0.20, 0.05 + (_context.Turn - 1) * 0.01);
+                lock (_match)
+                {
+                    for (int i = 0; i < _match._Players.Length; i++)
+                    {
+                        if (Random.Shared.NextDouble() >= chance) continue;
+
+                        List<Card> deck = _match._Players[i].hand.Deck;
+                        int insertAt = Random.Shared.Next(0, deck.Count + 1);
+                        deck.Insert(insertAt, joker);
+                        _players.Add(i);
+                        _insertIndexes.Add(insertAt);
+                    }
+                }
+
+                return Task.CompletedTask;
+            }
+
+            public RoundEventSnapshot ToSnapshot() => new()
+            {
+                EventType = "turn_start_joker_injection",
+                Description = DescribeEvent(),
+                SourcePlayer = null,
+                TargetPlayers = _players.ToArray(),
+                Data = new()
+                {
+                    ["insertIndexes"] = string.Join(",", _insertIndexes),
+                }
+            };
+        }
+
         private sealed class ForceWinnerFirstEvent : IRoundEvent
         {
             private readonly Match _match;
@@ -17,11 +74,11 @@ namespace WarButBetterBackend
 
             public Task RecieveUserChoice() => Task.CompletedTask;
 
-            public string DescribeEvent() => $"Player {_winner} was forced to play first on the next turn.";
+            public string DescribeEvent() => $"Player {_winner} is forced to play first on the next turn.";
 
             public Task ApplyEvent()
             {
-                lock (_match._sync)
+                lock (_match)
                 {
                     _match._firstPlayerNextTurn = _winner;
                 }
@@ -64,7 +121,7 @@ namespace WarButBetterBackend
                 Card[] topCards;
                 TaskCompletionSource<int>? pendingChoice = null;
 
-                lock (_match._sync)
+                lock (_match)
                 {
                     Hand hand = _match._Players[_player].hand;
                     int count = Math.Min(5, hand.Deck.Count);
@@ -103,7 +160,7 @@ namespace WarButBetterBackend
                 }
                 finally
                 {
-                    lock (_match._sync)
+                    lock (_match)
                     {
                         if (ReferenceEquals(_match._pendingTopFiveChoice, pendingChoice))
                         {
@@ -117,7 +174,7 @@ namespace WarButBetterBackend
 
             public Task ApplyEvent()
             {
-                lock (_match._sync)
+                lock (_match)
                 {
                     Hand hand = _match._Players[_player].hand;
                     int count = Math.Min(5, hand.Deck.Count);
@@ -146,7 +203,7 @@ namespace WarButBetterBackend
                 Description = DescribeEvent(),
                 SourcePlayer = _player,
                 TargetPlayers = [_player],
-                Data = new Dictionary<string, string>
+                Data = new ()
                 {
                     ["selectedIndex"] = _selectedIndex.ToString(),
                     ["chosenCard"] = _chosenCard?.ToString() ?? string.Empty,
@@ -172,7 +229,7 @@ namespace WarButBetterBackend
 
             public Task ApplyEvent()
             {
-                lock (_match._sync)
+                lock (_match)
                 {
                     List<Card> opponentDeck = _match._Players[_opponent].hand.Deck;
                     Card[] shuffled = opponentDeck.ToArray();
@@ -219,7 +276,7 @@ namespace WarButBetterBackend
 
             public Task ApplyEvent()
             {
-                lock (_match._sync)
+                lock (_match)
                 {
                     List<Card> winnerHand = _match._Players[_winner].hand.Cards;
                     List<Card> loserHand = _match._Players[_loser].hand.Cards;
@@ -242,7 +299,7 @@ namespace WarButBetterBackend
                 Description = DescribeEvent(),
                 SourcePlayer = _loser,
                 TargetPlayers = [_winner, _loser],
-                Data = new Dictionary<string, string>
+                Data = new ()
                 {
                     ["winnerHandIndex"] = _winnerIndex?.ToString() ?? string.Empty,
                     ["loserHandIndex"] = _loserIndex?.ToString() ?? string.Empty,
@@ -270,7 +327,7 @@ namespace WarButBetterBackend
 
             public Task ApplyEvent()
             {
-                lock (_match._sync)
+                lock (_match)
                 {
                     List<Card> deck = _match._Players[_player].hand.Deck;
                     List<int> kingIndexes = [];
@@ -304,7 +361,7 @@ namespace WarButBetterBackend
                 Description = DescribeEvent(),
                 SourcePlayer = _player,
                 TargetPlayers = [_player],
-                Data = new Dictionary<string, string>
+                Data = new ()
                 {
                     ["drewKing"] = _drewKing.ToString(),
                 }
@@ -327,7 +384,7 @@ namespace WarButBetterBackend
 
             public Task ApplyEvent()
             {
-                lock (_match._sync)
+                lock (_match)
                 {
                     _match._forceDeckPlayNextTurn[0] = true;
                     _match._forceDeckPlayNextTurn[1] = true;

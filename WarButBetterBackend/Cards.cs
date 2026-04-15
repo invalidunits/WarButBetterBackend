@@ -35,7 +35,7 @@
             var suite = GetSuite(card);
             var value = GetValue(card);
             if (suite == Suite.Jester && value == 0) return "Jester";
-            if (suite < Suite.Clover || suite >= Suite.Diamond) return "Unknown";
+            if (suite < Suite.Clover || suite > Suite.Diamond) return "Unknown";
             
 
             
@@ -51,7 +51,7 @@
         
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static Card GetCard(Suite suite, byte value) => (Card)(((byte)suite & 0b111) | (value << 3) & 0b11111);
+        public static Card GetCard(Suite suite, byte value) => (Card)(((byte)suite & 0b111) | ((value & 0b11111) << 3));
 
         public static readonly ReadOnlyCollection<Card> Standard52Deck = [
             GetCard(Suite.Clover, 2),

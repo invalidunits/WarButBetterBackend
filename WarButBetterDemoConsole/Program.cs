@@ -157,13 +157,12 @@ internal static class Program
 
         Uri queueUri = BuildWebSocketUri(baseUri, "match");
         Console.WriteLine($"Waiting for opponent via queue: {queueUri}");
-        Guid matchId = await JoinQueueAndWaitForMatchAsync(queueUri);
+
+        using var playerSocket = new ClientWebSocket();
+        Guid matchId = await JoinQueueAndWaitForMatchAsync(playerSocket, queueUri);
         Console.WriteLine($"Matched! Match ID: {matchId}");
 
-        Uri playerUri = BuildWebSocketUri(baseUri, $"match/{matchId}?spectate=false");
-        using var playerSocket = new ClientWebSocket();
-        await playerSocket.ConnectAsync(playerUri, CancellationToken.None);
-
+        // await playerSocket.ConnectAsync(playerUri, CancellationToken.None);
         var state = new PlayerState("Player 1", playerNumber: 0, isBot: autoPlay);
         await RunPlayerLoopAsync(playerSocket, state, interactive: !autoPlay);
     }
@@ -192,24 +191,18 @@ internal static class Program
         await Task.WhenAll(t1, t2);
     }
 
-    private static async Task<Guid> JoinQueueAndWaitForMatchAsync(Uri queueUri)
+    private static async Task<Guid> JoinQueueAndWaitForMatchAsync(ClientWebSocket socket, Uri queueUri)
     {
-        using var socket = new ClientWebSocket();
         await socket.ConnectAsync(queueUri, CancellationToken.None);
 
         string payload = await ReceiveTextMessageAsync(socket);
         MatchFoundMessage? message = JsonSerializer.Deserialize<MatchFoundMessage>(payload, JsonOptions);
-        if (message is null || message.MatchID == Guid.Empty)
+        if (message is null || message.Id == Guid.Empty)
         {
             throw new InvalidOperationException($"Queue response was invalid: {payload}");
         }
 
-        if (socket.State == WebSocketState.Open)
-        {
-            await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "queue-assigned", CancellationToken.None);
-        }
-
-        return message.MatchID;
+        return message.Id;
     }
 
     private static async Task<Guid> CreateMatchAsync(HttpClient httpClient)
@@ -238,7 +231,7 @@ internal static class Program
 
         string payload = await ReceiveTextMessageAsync(socket);
         MatchFoundMessage? message = JsonSerializer.Deserialize<MatchFoundMessage>(payload, JsonOptions);
-        if (message is null || message.MatchID == Guid.Empty)
+        if (message is null || message.Id == Guid.Empty)
         {
             throw new InvalidOperationException($"{playerName} received invalid payload: {payload}");
         }
@@ -248,7 +241,7 @@ internal static class Program
             await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "demo-finished", CancellationToken.None);
         }
 
-        return message.MatchID;
+        return message.Id;
     }
 
     private static async Task<string> ReceiveTextMessageAsync(ClientWebSocket socket)
@@ -291,10 +284,7 @@ internal static class Program
             switch (messageType)
             {
                 case "startingRoundIn":
-                    if (interactive)
-                    {
-                        Console.WriteLine("Match is starting soon...");
-                    }
+                    await PrintStartingRoundInAsync(root, interactive, state.Name);
                     break;
 
                 case "hand":
@@ -375,7 +365,7 @@ internal static class Program
             state.Hand.RemoveAt(chosenIndex);
             if (interactive)
             {
-                Console.WriteLine($"Played: {CardToString(played)}");
+                Console.WriteLine($"Played: {WarButBetterBackend.CardExtensions.CardToString(played)}");
             }
         }
     }
@@ -394,7 +384,7 @@ internal static class Program
             Console.WriteLine("Choose from top deck cards:");
             for (int i = 0; i < topFive.Length; i++)
             {
-                Console.WriteLine($"  [{i}] {CardToString((byte)topFive[i])}");
+                Console.WriteLine($"  [{i}] {WarButBetterBackend.CardExtensions.CardToString((byte)topFive[i])}");
             }
 
             Console.WriteLine("Enter choice index (default 0):");
@@ -427,7 +417,7 @@ internal static class Program
 
         for (int i = 0; i < state.Hand.Count; i++)
         {
-            Console.WriteLine($"  [{i}] {CardToString(state.Hand[i])}");
+            Console.WriteLine($"  [{i}] {WarButBetterBackend.CardExtensions.CardToString(state.Hand[i])}");
         }
     }
 
@@ -445,6 +435,77 @@ internal static class Program
         {
             Console.WriteLine($"Remaining cards -> P1: {remaining[0]}, P2: {remaining[1]}");
         }
+    }
+
+    private static async Task PrintStartingRoundInAsync(JsonElement root, bool interactive, string playerName)
+    {
+        string prefix = interactive ? string.Empty : $"{playerName}: ";
+
+        if (!root.TryGetProperty("time", out JsonElement timeNode) || timeNode.ValueKind != JsonValueKind.String)
+        {
+            Console.WriteLine($"{prefix}Match is starting soon...");
+            return;
+        }
+
+        string? timeText = timeNode.GetString();
+        if (string.IsNullOrWhiteSpace(timeText) || !DateTime.TryParse(timeText, out DateTime startUtc))
+        {
+            Console.WriteLine($"{prefix}Match is starting soon...");
+            return;
+        }
+
+        DateTime startUtcNormalized = startUtc.ToUniversalTime();
+        DateTime localStart = startUtcNormalized.ToLocalTime();
+
+        if (!interactive)
+        {
+            TimeSpan remaining = startUtcNormalized - DateTime.UtcNow;
+            int remainingSeconds = Math.Max(0, (int)Math.Ceiling(remaining.TotalSeconds));
+            Console.WriteLine($"{prefix}Match starts in {remainingSeconds}s ({localStart:T})");
+            return;
+        }
+
+        int previousLength = 0;
+        int previousSeconds = int.MinValue;
+        while (true)
+        {
+            TimeSpan remaining = startUtcNormalized - DateTime.UtcNow;
+            int remainingSeconds = Math.Max(0, (int)Math.Ceiling(remaining.TotalSeconds));
+
+            if (remainingSeconds != previousSeconds)
+            {
+                string message = $"{prefix}Match starts in {remainingSeconds}s ({localStart:T})";
+                WriteOverwritableLine(message, ref previousLength);
+                previousSeconds = remainingSeconds;
+            }
+
+            if (remainingSeconds == 0)
+            {
+                Console.WriteLine();
+                break;
+            }
+
+            await Task.Delay(100);
+        }
+    }
+
+    private static void WriteOverwritableLine(string message, ref int previousLength)
+    {
+        if (previousLength > 0)
+        {
+            Console.Write(new string('\b', previousLength));
+        }
+
+        Console.Write(message);
+
+        if (message.Length < previousLength)
+        {
+            int toClear = previousLength - message.Length;
+            Console.Write(new string(' ', toClear));
+            Console.Write(new string('\b', toClear));
+        }
+
+        previousLength = message.Length;
     }
 
     private static void PrintMatchEnded(JsonElement root, bool interactive, string playerName)
@@ -489,36 +550,6 @@ internal static class Program
         await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, reason, CancellationToken.None);
     }
 
-    private static string CardToString(byte card)
-    {
-        int suite = card & 0b111;
-        int value = (card >> 3) & 0b11111;
-        if (suite == 4 && value == 0)
-        {
-            return "Jester";
-        }
-
-        string suiteName = suite switch
-        {
-            0 => "Clover",
-            1 => "Heart",
-            2 => "Spade",
-            3 => "Diamond",
-            _ => "Unknown",
-        };
-
-        string valueName = value switch
-        {
-            11 => "Jack",
-            12 => "Queen",
-            13 => "King",
-            14 => "Ace",
-            _ => value.ToString(),
-        };
-
-        return $"{valueName} of {suiteName}";
-    }
-
     private static Uri BuildWebSocketUri(Uri baseUri, string relativePath)
     {
         string scheme = baseUri.Scheme switch
@@ -547,7 +578,7 @@ internal static class Program
         return builder.Uri;
     }
 
-    private sealed record MatchFoundMessage(string Type, Guid MatchID);
+    private sealed record MatchFoundMessage(string Type, DateTime CreatedAt, Guid Id);
 
     private enum DemoMode
     {

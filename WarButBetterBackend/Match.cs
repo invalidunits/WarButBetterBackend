@@ -1,40 +1,8 @@
+using System.Collections.Specialized;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-
-/*
-2 player game, each player has a hand of 5 cards and a deck of 54 cards, split into 27 random cards for each player. Each card is given an effect and wins against any card of a lower rank. Players can play any card in their hand each turn. Once a player's deck is fully depleted, that player loses.
-
-Rules for cards
-
-Highest card capttures. If a card has an effect that captures the opposing card, It overrides unless...
-
-The other card has a similar effect against our card,
-War: If both placed cards are identical, both players place 3 of their remaining cards in hand and place their 4th on top, the higher card takes every card currently placed. If both top cards are equal again, draw top 4 cards from each and repeat. If both players don't have enough cards for a war it's a tie. If one player doesn't have enough cards for a war, the other wins.
-
-You lose if
-
-If you have no remaining cards.
-If you have no cards to sacrifice for war
-If you only have jokers
-Each card effect:
-
-Joker: Burns any card from the game permanently. (self destructs) ( Placed upside down and becomes effectless in war )
-2: If captured, Force the other player to place first next turn.
-3: If captured, Choose a card from the top 5 cards in your deck.
-4: Shuffle the opponents deck.
-5: If this card loses, swap any card from your hand with a card from the opponents (you do not see their)
-6: Always captures anything in it's suite
-7: Always captures 9
-8: No effect
-9: Can be played as a 6.
-10: Disables any card effect.
-Jack: If Jack is played in war, it always captures.
-Queen: If captured grab a random King from your Deck If no King is available, this card has no effect
-King: Both players play a random card next turn (top card in deck)
-Ace: You always capture (unless it's a joker), but any card effects apply whether you win or lose.
-*/
 
 namespace WarButBetterBackend
 {
@@ -53,12 +21,13 @@ namespace WarButBetterBackend
         public MatchState State { get; private set; }
         public Task? Game { get; private set; }
         public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
+        public Guid Id { get; private set;}
 
         public int ConnectedPlayerCount
         {
             get
             {
-                lock (_sync)
+                lock (this)
                 {
                     int count = 0;
                     for (int i = 0; i < _Players.Length; i++)
@@ -68,8 +37,9 @@ namespace WarButBetterBackend
             }
         }
 
-        public Match()
+        public Match(Guid Id)
         {
+            this.Id = Id;
             State = MatchState.WaitingForPlayers;
             _Players = [(null, new Hand()), (null, new Hand())];
             _Clients = new(_Players.Length);
@@ -106,7 +76,7 @@ namespace WarButBetterBackend
                         ? ctx.bestOutcome
                         : ctx.currentOutcome),
 
-                new(14, EffectTrigger.WhenEither, OneUP: ctx => ctx.WarMode? ctx.currentOutcome : RoundResult.JokerBurn),
+                new(14, EffectTrigger.WhenEither, OneUP: ctx => ctx.bestOutcome),
             ];
         }
 
@@ -204,7 +174,7 @@ namespace WarButBetterBackend
                 
                 while (!cancellationSource.IsCancellationRequested)
                 {
-                    int outcome = EvaluateImmediateOutcome();
+                    RoundResult outcome = EvaluateImmediateOutcome();
                     if (outcome >= 0)
                     {
                         await EndGame(outcome, "deck-exhausted");
@@ -212,8 +182,14 @@ namespace WarButBetterBackend
                     }
 
                     Interlocked.Increment(ref Turn);
-                    InjectRandomJokersForTurn(Turn);
-                    lock (_sync)
+                    List<RoundEventSnapshot> appliedEvents = [];
+                    if (cancellationSource.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    
+
+                    lock (this)
                     {
                         _pendingTurns =
                         [
@@ -224,7 +200,7 @@ namespace WarButBetterBackend
 
                     await SendHandStates();
                     int? firstPlayer;
-                    lock (_sync)
+                    lock (this)
                     {
                         firstPlayer = _firstPlayerNextTurn;
                         _firstPlayerThisTurn = firstPlayer;
@@ -243,7 +219,7 @@ namespace WarButBetterBackend
                         Played = played,
                         Pile = [played[0], played[1]],
                         Events = [],
-                        AppliedEvents = [],
+                        AppliedEvents = appliedEvents,
                     };
 
                     RoundResult roundWinner = ResolveBattle(played[0], played[1], ctx.Pile);
@@ -251,7 +227,7 @@ namespace WarButBetterBackend
                     if (roundWinner == RoundResult.WarTie)
                     {
                         FinalizeRoundContext(ctx);
-                        await EndGame(-1, "war-tie");
+                        await EndGame(RoundResult.WarTie, "war-tie");
                         break;
                     }
 
@@ -273,6 +249,7 @@ namespace WarButBetterBackend
                     ctx.Winner = roundWinner == RoundResult.Player0Capture ? 0 : 1;
                     ctx.EffectsDisabled = CardExtensions.GetValue(played[0]) == 10
                                        || CardExtensions.GetValue(played[1]) == 10;
+                    AddTurnEvents(ctx);
                     QueueCardEffects(ctx);
                     await ApplyQueuedEffects(ctx);
                     CollectCards(ctx.Winner, ctx.Pile);
@@ -292,7 +269,7 @@ namespace WarButBetterBackend
             catch (OperationCanceledException) {}
             finally
             {
-                lock (_sync)
+                lock (this)
                 {
                     _pendingTurns = null;
                     State = MatchState.WaitingForPlayers;
@@ -303,7 +280,7 @@ namespace WarButBetterBackend
         private Task SendHandStates()
         {
             List<Task> sendTasks = new(_Players.Length);
-            lock (_sync)
+            lock (this)
             {
                 for (int i = 0; i < _Players.Length; i++)
                 {
@@ -331,19 +308,27 @@ namespace WarButBetterBackend
 
         private void RemovePlayer(int i)
         {
-            lock (_sync)
+            lock (this)
             {
                 _Players[i].client?.RecieveData -= RecieveData;
                 _Players[i].client?.Closed -= RemoveClient;
                 _Players[i].client = null;
 
-                if  (State != MatchState.WaitingForPlayers) cancellationSource.Cancel();
+                if  (State != MatchState.WaitingForPlayers) 
+                {
+                    EndGame(RoundResult.Tie, "player-disconnect").Wait();
+                }
             }
         }
 
-        public void RecieveTurn(int player, byte playedCard)
+        public async Task RecieveTurn(int player, byte playedCard)
         {
-            lock (_sync)
+            bool accepted = false;
+            bool revealCard = false;
+            Card acceptedCard = 0;
+            int turn = 0;
+
+            lock (this)
             {
                 if (State != MatchState.RunningGame || _pendingTurns is null)
                 {
@@ -366,21 +351,49 @@ namespace WarButBetterBackend
                     }
 
                     _forceDeckPlayNextTurn[player] = false;
-                    _playedCards[player] = deckCard;
-                    _pendingTurns[player].TrySetResult(deckCard);
-                    return;
+                    accepted = true;
+                    acceptedCard = deckCard;
+                    revealCard = _firstPlayerThisTurn == player;
+                    turn = Turn;
                 }
+                else
+                {
+                    int index = hand.Cards.IndexOf(playedCard);
+                    if (index < 0)
+                    {
+                        return;
+                    }
 
-                int index = hand.Cards.IndexOf(playedCard);
-                if (index < 0)
+                    hand.Cards.RemoveAt(index);
+                    hand.FillHand();
+                    accepted = true;
+                    acceptedCard = playedCard;
+                    revealCard = _firstPlayerThisTurn == player;
+                    turn = Turn;
+                }
+            }
+
+            if (!accepted)
+            {
+                return;
+            }
+
+            await SendToPlayer(1 - player, new {
+                type = "opponentPlayed",
+                turn,
+                player,
+                card = revealCard ? (int?)acceptedCard : null
+            });
+
+            lock (this)
+            {
+                if (State != MatchState.RunningGame || _pendingTurns is null)
                 {
                     return;
                 }
 
-                hand.Cards.RemoveAt(index);
-                hand.FillHand();
-                _playedCards[player] = playedCard;
-                _pendingTurns[player].TrySetResult(playedCard);
+                _playedCards[player] = acceptedCard;
+                _pendingTurns[player].TrySetResult(acceptedCard);
             }
         }
 
@@ -390,7 +403,7 @@ namespace WarButBetterBackend
             _ = playedCards;
         }
 
-        public void RecieveData(ClientSession client, Span<byte> data, WebSocketReceiveResult result)
+        public async Task RecieveData(ClientSession client, ReadOnlyMemory<byte> data, WebSocketReceiveResult result)
         {
             if (!_Clients.Contains(client)) return;
 
@@ -399,7 +412,7 @@ namespace WarButBetterBackend
                 return;
             }
 
-            ReadOnlySpan<byte> incoming = data[..result.Count];
+            ReadOnlySpan<byte> incoming = data.Span[..result.Count];
             JsonElement root;
             try
             {
@@ -422,7 +435,7 @@ namespace WarButBetterBackend
                 {
                     if (string.Equals(type, "effectChoice", StringComparison.OrdinalIgnoreCase))
                     {
-                        lock (_sync)
+                        lock (this)
                         {
                             if (_pendingTopFiveChoice is not null
                                 && _pendingTopFiveChoicePlayer == i
@@ -439,17 +452,22 @@ namespace WarButBetterBackend
                     {
                         if (root.TryGetProperty("card", out JsonElement cardValue) && cardValue.TryGetByte(out byte playedCard))
                         {
-                            RecieveTurn(i, playedCard);
+                            await RecieveTurn(i, playedCard);
                         }
                         else if (root.TryGetProperty("cardIndex", out JsonElement cardIndex) && cardIndex.TryGetInt32(out int index))
                         {
-                            lock (_sync)
+                            byte selectedCard;
+                            lock (this)
                             {
-                                if (index >= 0 && index < _Players[i].hand.Cards.Count)
+                                if (index < 0 || index >= _Players[i].hand.Cards.Count)
                                 {
-                                    RecieveTurn(i, _Players[i].hand.Cards[index]);
+                                    break;
                                 }
+
+                                selectedCard = _Players[i].hand.Cards[index];
                             }
+
+                            await RecieveTurn(i, selectedCard);
                         }
                     }
 
@@ -460,7 +478,7 @@ namespace WarButBetterBackend
 
         public void RemoveClient(ClientSession clientSession)
         {
-            lock (_sync)
+            lock (this)
             {
                 for (int i = 0; i < _Players.Length; i++)
                 {
@@ -476,7 +494,7 @@ namespace WarButBetterBackend
         private async Task<Card[]> WaitForTurns()
         {
             Task<Card>[] waits;
-            lock (_sync)
+            lock (this)
             {
                 if (_pendingTurns is null)
                 {
@@ -490,36 +508,26 @@ namespace WarButBetterBackend
             }
 
             Card[] cards = await Task.WhenAll(waits).WaitAsync(cancellationSource.Token);
-            lock (_sync)
+            lock (this)
             {
                 _firstPlayerThisTurn = null;
             }
             return cards;
         }
 
-        private int EvaluateImmediateOutcome()
+        private RoundResult EvaluateImmediateOutcome()
         {
-            lock (_sync)
+            lock (this)
             {
                 bool player0Alive = EnsureCardsAvailable(0);
                 bool player1Alive = EnsureCardsAvailable(1);
 
                 if (!player0Alive && !player1Alive)
                 {
-                    return -1;
+                    return RoundResult.Tie;
                 }
-
-                if (!player0Alive)
-                {
-                    return 1;
-                }
-
-                if (!player1Alive)
-                {
-                    return 0;
-                }
-
-                return -2;
+                
+                return player0Alive? RoundResult.Player0Capture : RoundResult.Player1Capture;
             }
         }
 
@@ -530,25 +538,11 @@ namespace WarButBetterBackend
             return hand.Cards.Count > 0 || hand.Deck.Count > 0;
         }
 
-        private void InjectRandomJokersForTurn(int turn)
+        private void AddTurnEvents(RoundContext ctx)
         {
-            // Increase chance each turn and cap it to avoid guaranteed joker spam.
-            double chance = Math.Min(0.20, 0.05 + (turn - 1) * 0.01);
-            Card joker = CardExtensions.GetCard(CardExtensions.Suite.Jester, 0);
-
-            lock (_sync)
+            if (ctx.Turn > 1)
             {
-                for (int i = 0; i < _Players.Length; i++)
-                {
-                    if (Random.Shared.NextDouble() >= chance)
-                    {
-                        continue;
-                    }
-
-                    List<Card> deck = _Players[i].hand.Deck;
-                    int insertAt = Random.Shared.Next(0, deck.Count + 1);
-                    deck.Insert(insertAt, joker);
-                }
+                ctx.Events.AddLast(new RandomJokerInjectionEvent(this, ctx));
             }
         }
 
@@ -569,7 +563,7 @@ namespace WarButBetterBackend
             {
                 Card[] topCards = new Card[_Players.Length];
 
-                lock (_sync)
+                lock (this)
                 {
                     bool p0CanWar = CanDrawCards(0, 4);
                     bool p1CanWar = CanDrawCards(1, 4);
@@ -673,6 +667,15 @@ namespace WarButBetterBackend
         {
             if (ctx.EffectsDisabled) return;
 
+            int p0CardValue = CardExtensions.GetValue(ctx.Played[0]);
+            int p1CardValue = CardExtensions.GetValue(ctx.Played[1]);
+            int aceValue = (int)CardExtensions.SpecialValues.Ace;
+            int? opposingCardPlayerForAce = p0CardValue == aceValue && p1CardValue != aceValue
+                ? 1
+                : p1CardValue == aceValue && p0CardValue != aceValue
+                    ? 0
+                    : null;
+
             foreach (CardDetails detail in _cardDetails)
             {
                 if (detail.CreateEvent is null)
@@ -689,17 +692,51 @@ namespace WarButBetterBackend
                     _ => false,
                 };
 
-                if (!applies)
+                bool forcedByAceRule = !applies
+                    && opposingCardPlayerForAce is int opposingCardPlayer
+                    && CardExtensions.GetValue(ctx.Played[opposingCardPlayer]) == detail.CardValue;
+
+                if (!applies && !forcedByAceRule)
                 {
                     continue;
                 }
 
-                IRoundEvent? @event = detail.CreateEvent(ctx);
+                RoundContext effectCtx = ctx;
+                if (forcedByAceRule && opposingCardPlayerForAce is int forcedPlayer)
+                {
+                    int forcedWinner = detail.Trigger switch
+                    {
+                        EffectTrigger.WhenWinner => forcedPlayer,
+                        EffectTrigger.WhenLoser => 1 - forcedPlayer,
+                        _ => ctx.Winner,
+                    };
+
+                    effectCtx = CloneRoundContextWithWinner(ctx, forcedWinner);
+                }
+
+                IRoundEvent? @event = detail.CreateEvent(effectCtx);
                 if (@event is not null)
                 {
                     ctx.Events.AddLast(@event);
                 }
             }
+        }
+
+        private static RoundContext CloneRoundContextWithWinner(RoundContext source, int winner)
+        {
+            return new RoundContext
+            {
+                Turn = source.Turn,
+                Played = source.Played,
+                Pile = source.Pile,
+                Events = [],
+                AppliedEvents = source.AppliedEvents,
+                EffectsDisabled = source.EffectsDisabled,
+                OutcomeCode = source.OutcomeCode,
+                Winner = winner,
+                RemainingCards = source.RemainingCards,
+                BurnedCardsTotal = source.BurnedCardsTotal,
+            };
         }
 
         private async Task ApplyQueuedEffects(RoundContext ctx)
@@ -714,7 +751,7 @@ namespace WarButBetterBackend
 
         private void FinalizeRoundContext(RoundContext ctx)
         {
-            lock (_sync)
+            lock (this)
             {
                 ctx.RemainingCards =
                 [
@@ -728,7 +765,7 @@ namespace WarButBetterBackend
 
         public IReadOnlyList<RoundContext> GetRoundHistory()
         {
-            lock (_sync)
+            lock (this)
             {
                 return _roundHistory.ToArray();
             }
@@ -736,7 +773,7 @@ namespace WarButBetterBackend
 
         private void CollectCards(int winner, List<Card> pile)
         {
-            lock (_sync)
+            lock (this)
             {
                 _Players[winner].hand.AddToDeck(pile);
                 _Players[winner].hand.FillHand();
@@ -746,7 +783,7 @@ namespace WarButBetterBackend
 
         private void BurnCards(List<Card> cards)
         {
-            lock (_sync)
+            lock (this)
             {
                 _burnedCards.AddRange(cards);
             }
@@ -789,7 +826,7 @@ namespace WarButBetterBackend
         {
             byte[] bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload));
             Task[] sendTasks;
-            lock (_sync)
+            lock (this)
             {
                 sendTasks = _Clients
                     .Select(c => c.webSocket.SendAsync(bytes, WebSocketMessageType.Text, true, cancellationSource.Token))
@@ -802,7 +839,7 @@ namespace WarButBetterBackend
         private Task SendToPlayer(int player, object payload)
         {
             ClientSession? client;
-            lock (_sync)
+            lock (this)
             {
                 client = _Players[player].client;
             }
@@ -816,7 +853,7 @@ namespace WarButBetterBackend
             return client.webSocket.SendAsync(bytes, WebSocketMessageType.Text, true, cancellationSource.Token);
         }
 
-        private async Task EndGame(int winner, string reason)
+        private async Task EndGame(RoundResult winner, string reason)
         {
             await Broadcast(new {
                 type = "matchEnded",
@@ -833,7 +870,6 @@ namespace WarButBetterBackend
         private readonly bool[] _forceDeckPlayNextTurn;
         private int? _firstPlayerNextTurn;
         private int? _firstPlayerThisTurn;
-        private readonly object _sync = new();
         private TaskCompletionSource<Card>[]? _pendingTurns;
         private TaskCompletionSource<int>? _pendingTopFiveChoice;
         private int? _pendingTopFiveChoicePlayer;
@@ -884,7 +920,7 @@ namespace WarButBetterBackend
             [JsonInclude] public required string Description;
             [JsonInclude] public int? SourcePlayer;
             [JsonInclude] public int[] TargetPlayers = [];
-            [JsonInclude] public Dictionary<string, string> Data = [];
+            [JsonInclude] public NameValueCollection Data = [];
         }
 
         // ---- Post-round effect table ----------------------------------------
