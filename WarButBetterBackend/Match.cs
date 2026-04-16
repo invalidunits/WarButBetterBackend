@@ -80,8 +80,9 @@ namespace WarButBetterBackend
             ];
         }
 
-        public void AddClient(ClientSession clientSession, bool AsPlayer)
+        public int? AddClient(ClientSession clientSession, bool AsPlayer)
         {
+            int? playerIndex = null;
             lock (this)
             {
                 _Clients.Add(clientSession);
@@ -96,6 +97,7 @@ namespace WarButBetterBackend
                         {
                             spotFound = true;
                             _Players[i].client = clientSession;
+                            playerIndex = i;
                             break;
                         }
                     }
@@ -124,8 +126,10 @@ namespace WarButBetterBackend
                         _playedCards = [0, 0];
                         Game = Task.Run(Play);
                     }
-                }   
+                }
             }
+
+            return playerIndex;
         }
 
         public async Task Play()
@@ -174,10 +178,10 @@ namespace WarButBetterBackend
                 
                 while (!cancellationSource.IsCancellationRequested)
                 {
-                    RoundResult outcome = EvaluateImmediateOutcome();
-                    if (outcome >= 0)
+                    RoundResult? outcome = EvaluateImmediateOutcome();
+                    if (outcome != null)
                     {
-                        await EndGame(outcome, "deck-exhausted");
+                        await EndGame(outcome.Value, "deck-exhausted");
                         break;
                     }
 
@@ -515,12 +519,13 @@ namespace WarButBetterBackend
             return cards;
         }
 
-        private RoundResult EvaluateImmediateOutcome()
+        private RoundResult? EvaluateImmediateOutcome()
         {
             lock (this)
             {
                 bool player0Alive = EnsureCardsAvailable(0);
                 bool player1Alive = EnsureCardsAvailable(1);
+                if (player0Alive && player1Alive) return null;
 
                 if (!player0Alive && !player1Alive)
                 {
@@ -528,7 +533,7 @@ namespace WarButBetterBackend
                 }
                 
                 return player0Alive? RoundResult.Player0Capture : RoundResult.Player1Capture;
-            }
+            }    
         }
 
         private bool EnsureCardsAvailable(int player)

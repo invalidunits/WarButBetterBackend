@@ -1,5 +1,4 @@
 using Microsoft.AspNetCore.Mvc;
-using System.Collections.ObjectModel;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -13,13 +12,7 @@ namespace WarButBetterBackend
 
         private static readonly Dictionary<Guid, Match> _matches = [];
         public Dictionary<Guid, Match> Matches => _matches;
-        private static readonly Queue<WaitingPlayer> WaitingPlayers = [];
-
-        private sealed class WaitingPlayer
-        {
-            public required WebSocket Socket;
-            public required TaskCompletionSource<Match> MatchFound;
-        }
+        private static readonly Queue<TaskCompletionSource<Match>> WaitingPlayers = [];
 
         [HttpOptions]
         public IActionResult ListMatches()
@@ -42,34 +35,21 @@ namespace WarButBetterBackend
         [HttpGet]
         public async Task<IActionResult> WaitForMatch()
         {
-            if (!HttpContext.WebSockets.IsWebSocketRequest)
-            {
-                logger.LogWarning("Rejected non-websocket matchmaking request.");
-                return BadRequest("Must be a websocket request");
-            }
-
-            WebSocket socket = await HttpContext.WebSockets.AcceptWebSocketAsync();
-            logger.LogInformation("Accepted matchmaking websocket from {RemoteIp}.", HttpContext.Connection.RemoteIpAddress);
-            var waiter = new WaitingPlayer
-            {
-                Socket = socket,
-                MatchFound = new TaskCompletionSource<Match>(TaskCreationOptions.RunContinuationsAsynchronously),
-            };
-
+            var waiter = new TaskCompletionSource<Match>(TaskCreationOptions.RunContinuationsAsynchronously);
             try
             {
                 lock (_matches)
                 {
                     if (WaitingPlayers.Count > 0)
                     {
-                        WaitingPlayer other = WaitingPlayers.Dequeue();
+                        var other = WaitingPlayers.Dequeue();
                         Match newMatch = CreateMatchLocked();
                         logger.LogInformation(
                             "Matched two waiting players into match {MatchId}. Remaining queue length: {QueueLength}.",
                             newMatch.Id,
                             WaitingPlayers.Count);
-                        other.MatchFound.TrySetResult(newMatch);
-                        waiter.MatchFound.TrySetResult(newMatch);
+                        other.TrySetResult(newMatch);
+                        waiter.TrySetResult(newMatch);
                     }
                     else
                     {
@@ -78,23 +58,20 @@ namespace WarButBetterBackend
                     }
                 }
 
-                Match match = await waiter.MatchFound.Task.WaitAsync(HttpContext.RequestAborted);
-                byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
+                Match match = await waiter.Task.WaitAsync(HttpContext.RequestAborted);
+                return Ok(new
                 {
                     type = "matchFound",
-                    match.CreatedAt,
-                    match.Id
-                }));
-
-                await socket.SendAsync(payload, WebSocketMessageType.Text, true, HttpContext.RequestAborted);
-                return await _Connect(socket, match, false);
+                    id = match.Id,
+                    createdAt = match.CreatedAt,
+                });
             }
             catch (OperationCanceledException)
             {
-                logger.LogInformation("Matchmaking websocket request was canceled.");
-                lock (WaitingPlayers)
+                logger.LogInformation("HTTP matchmaking request was canceled.");
+                lock (_matches)
                 {
-                    if (waiter.MatchFound.Task.IsCompleted)
+                    if (waiter.Task.IsCompleted)
                     {
                         throw;
                     }
@@ -103,7 +80,7 @@ namespace WarButBetterBackend
                     int count = WaitingPlayers.Count;
                     for (int i = 0; i < count; i++)
                     {
-                        WaitingPlayer item = WaitingPlayers.Dequeue();
+                        TaskCompletionSource<Match> item = WaitingPlayers.Dequeue();
                         if (!ReferenceEquals(item, waiter))
                         {
                             WaitingPlayers.Enqueue(item);
@@ -111,12 +88,7 @@ namespace WarButBetterBackend
                     }
                 }
 
-                return new EmptyResult();
-            }
-            finally
-            {
-                logger.LogDebug("Disposing matchmaking websocket.");
-                socket.Dispose();
+                return NoContent();
             }
         }
 
@@ -138,23 +110,23 @@ namespace WarButBetterBackend
         [HttpGet("{matchID}")]
         public async Task<IActionResult> Connect(Guid matchID, [FromQuery] bool spectate)
         {
+            Match? match = null;
+            lock (_matches)
+            {
+                if (_matches.ContainsKey(matchID))
+                {
+                    match = _matches[matchID];
+                }
+            }
+
+            if (match is null)
+            {
+                logger.LogWarning("Connection attempt for missing match {MatchId}.", matchID);
+                return NotFound();
+            }
+
             if (HttpContext.WebSockets.IsWebSocketRequest)
             {
-                Match? match = null;
-                lock (_matches)
-                {
-                    if (_matches.ContainsKey(matchID))
-                    {
-                        match = _matches[matchID];
-                    }
-                }
-
-                if (match is null)
-                {
-                    logger.LogWarning("Connection attempt for missing match {MatchId}.", matchID);
-                    return NotFound();
-                }
-
                 logger.LogInformation(
                     "Accepted websocket connect for match {MatchId}. Spectator mode: {Spectate}.",
                     matchID,
@@ -181,7 +153,19 @@ namespace WarButBetterBackend
 
             try
             {
-                match.AddClient(session, !spectate);
+                int? playerIndex = match.AddClient(session, !spectate);
+                if (socket.State == WebSocketState.Open)
+                {
+                    byte[] joinedPayload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
+                    {
+                        type = "joinedMatch",
+                        matchId = match.Id,
+                        player = playerIndex,
+                        spectate,
+                    }));
+                    await socket.SendAsync(joinedPayload, WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+
                 await session.Completion;
                 logger.LogInformation("Client session completed for match {MatchId}.", match.Id);
                 return new EmptyResult();

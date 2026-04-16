@@ -20,7 +20,7 @@ internal static class Program
         using var httpClient = new HttpClient
         {
             BaseAddress = options.BaseUri,
-            Timeout = TimeSpan.FromSeconds(10),
+            Timeout = TimeSpan.FromMinutes(5),
         };
 
         try
@@ -29,17 +29,17 @@ internal static class Program
             {
                 case DemoMode.Api:
                     await RunHttpDemoAsync(httpClient);
-                    await RunWebSocketMatchmakingDemoAsync(options.BaseUri);
+                    await RunHttpMatchmakingDemoAsync(httpClient);
                     break;
                 case DemoMode.Play:
-                    await RunQueuedPlayerGameDemoAsync(options.BaseUri, options.AutoPlay);
+                    await RunQueuedPlayerGameDemoAsync(httpClient, options.BaseUri, options.AutoPlay);
                     break;
                 case DemoMode.PlayAgainstBot:
                     await RunPlayableGameDemoAsync(httpClient, options.BaseUri, options.AutoPlay);
                     break;
                 case DemoMode.All:
                     await RunHttpDemoAsync(httpClient);
-                    await RunWebSocketMatchmakingDemoAsync(options.BaseUri);
+                    await RunHttpMatchmakingDemoAsync(httpClient);
                     await RunPlayableGameDemoAsync(httpClient, options.BaseUri, options.AutoPlay);
                     break;
                 default:
@@ -129,15 +129,14 @@ internal static class Program
         }
     }
 
-    private static async Task RunWebSocketMatchmakingDemoAsync(Uri baseUri)
+    private static async Task RunHttpMatchmakingDemoAsync(HttpClient httpClient)
     {
-        Console.WriteLine("\n=== WebSocket Matchmaking Demo ===");
-        Uri wsUri = BuildWebSocketUri(baseUri, "match");
-        Console.WriteLine($"Connecting two players to: {wsUri}");
+        Console.WriteLine("\n=== HTTP Matchmaking Demo ===");
+        Console.WriteLine("Starting two HTTP queue requests to /match...");
 
-        Task<Guid> playerOne = ConnectAndWaitForMatchAsync(wsUri, "Player 1");
+        Task<Guid> playerOne = WaitForMatchAsync(httpClient, "Player 1");
         await Task.Delay(200);
-        Task<Guid> playerTwo = ConnectAndWaitForMatchAsync(wsUri, "Player 2");
+        Task<Guid> playerTwo = WaitForMatchAsync(httpClient, "Player 2");
 
         Guid[] matchIds = await Task.WhenAll(playerOne, playerTwo);
         Console.WriteLine($"Player 1 received matchID: {matchIds[0]}");
@@ -147,7 +146,7 @@ internal static class Program
             : "Warning: players received different match IDs.");
     }
 
-    private static async Task RunQueuedPlayerGameDemoAsync(Uri baseUri, bool autoPlay)
+    private static async Task RunQueuedPlayerGameDemoAsync(HttpClient httpClient, Uri baseUri, bool autoPlay)
     {
         Console.WriteLine("\n=== Queue Match (Random Opponent) ===");
         if (!autoPlay)
@@ -155,14 +154,15 @@ internal static class Program
             Console.WriteLine("Joining queue as Player 1. Enter a card index when prompted.");
         }
 
-        Uri queueUri = BuildWebSocketUri(baseUri, "match");
-        Console.WriteLine($"Waiting for opponent via queue: {queueUri}");
+        Console.WriteLine("Waiting for opponent via HTTP queue endpoint /match");
+        Guid matchId = await WaitForMatchAsync(httpClient, "Player 1");
 
-        using var playerSocket = new ClientWebSocket();
-        Guid matchId = await JoinQueueAndWaitForMatchAsync(playerSocket, queueUri);
         Console.WriteLine($"Matched! Match ID: {matchId}");
 
-        // await playerSocket.ConnectAsync(playerUri, CancellationToken.None);
+        Uri playerUri = BuildWebSocketUri(baseUri, $"match/{matchId}?spectate=false");
+        using var playerSocket = new ClientWebSocket();
+        await playerSocket.ConnectAsync(playerUri, CancellationToken.None);
+
         var state = new PlayerState("Player 1", playerNumber: 0, isBot: autoPlay);
         await RunPlayerLoopAsync(playerSocket, state, interactive: !autoPlay);
     }
@@ -191,15 +191,16 @@ internal static class Program
         await Task.WhenAll(t1, t2);
     }
 
-    private static async Task<Guid> JoinQueueAndWaitForMatchAsync(ClientWebSocket socket, Uri queueUri)
+    private static async Task<Guid> WaitForMatchAsync(HttpClient httpClient, string playerName)
     {
-        await socket.ConnectAsync(queueUri, CancellationToken.None);
+        using HttpResponseMessage response = await httpClient.GetAsync("match");
+        response.EnsureSuccessStatusCode();
 
-        string payload = await ReceiveTextMessageAsync(socket);
+        string payload = await response.Content.ReadAsStringAsync();
         MatchFoundMessage? message = JsonSerializer.Deserialize<MatchFoundMessage>(payload, JsonOptions);
         if (message is null || message.Id == Guid.Empty)
         {
-            throw new InvalidOperationException($"Queue response was invalid: {payload}");
+            throw new InvalidOperationException($"{playerName} received invalid queue payload: {payload}");
         }
 
         return message.Id;
@@ -222,26 +223,6 @@ internal static class Program
 
         string body = await response.Content.ReadAsStringAsync();
         return JsonSerializer.Deserialize<List<Guid>>(body, JsonOptions) ?? [];
-    }
-
-    private static async Task<Guid> ConnectAndWaitForMatchAsync(Uri wsUri, string playerName)
-    {
-        using var socket = new ClientWebSocket();
-        await socket.ConnectAsync(wsUri, CancellationToken.None);
-
-        string payload = await ReceiveTextMessageAsync(socket);
-        MatchFoundMessage? message = JsonSerializer.Deserialize<MatchFoundMessage>(payload, JsonOptions);
-        if (message is null || message.Id == Guid.Empty)
-        {
-            throw new InvalidOperationException($"{playerName} received invalid payload: {payload}");
-        }
-
-        if (socket.State == WebSocketState.Open)
-        {
-            await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "demo-finished", CancellationToken.None);
-        }
-
-        return message.Id;
     }
 
     private static async Task<string> ReceiveTextMessageAsync(ClientWebSocket socket)
@@ -283,6 +264,14 @@ internal static class Program
             string? messageType = typeNode.GetString();
             switch (messageType)
             {
+                case "joinedMatch":
+                    if (root.TryGetProperty("player", out JsonElement playerNode)
+                        && playerNode.ValueKind == JsonValueKind.Number)
+                    {
+                        state.PlayerNumber = playerNode.GetInt32();
+                    }
+                    break;
+
                 case "startingRoundIn":
                     await PrintStartingRoundInAsync(root, interactive, state.Name);
                     break;
@@ -600,7 +589,7 @@ internal static class Program
         }
 
         public string Name { get; }
-        public int PlayerNumber { get; }
+        public int PlayerNumber { get; set; }
         public bool IsBot { get; }
         public List<byte> Hand { get; set; } = [];
         public int DeckLength { get; set; }

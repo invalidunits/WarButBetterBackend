@@ -10,7 +10,7 @@ namespace WarButBetterTests;
 public class MatchTests
 {
     private static Match CreateMatch() => new(Guid.NewGuid());
-    private static ClientSession CreateSession() => new(new FakeClosedWebSocket(), NullLogger<ClientSession>.Instance);
+    private static ClientSession CreateSession() => new(new FakeOpenWebSocket(), NullLogger<ClientSession>.Instance);
 
     [Fact]
     public void NewMatch_StartsInWaitingForPlayersState()
@@ -34,6 +34,21 @@ public class MatchTests
 
         var exception = Assert.Throws<InvalidOperationException>(() => match.AddClient(thirdPlayer, AsPlayer: true));
         Assert.Contains("No more remaining spots", exception.Message);
+    }
+
+    [Fact]
+    public void AddClient_AsPlayer_ReturnsAssignedPlayerIndex()
+    {
+        var match = CreateMatch();
+
+        using var firstPlayer = CreateSession();
+        using var secondPlayer = CreateSession();
+
+        int? firstIndex = match.AddClient(firstPlayer, AsPlayer: true);
+        int? secondIndex = match.AddClient(secondPlayer, AsPlayer: true);
+
+        Assert.Equal(0, firstIndex);
+        Assert.Equal(1, secondIndex);
     }
 
     [Fact]
@@ -89,7 +104,7 @@ public class MatchmakingControllerTests
     }
 
     [Fact]
-    public async Task WaitForMatch_WhenNotWebSocket_ReturnsBadRequest()
+    public async Task WaitForMatch_WithTwoHttpCallers_ReturnsSameMatchId()
     {
         var controller = CreateController();
         controller.ControllerContext = new ControllerContext
@@ -97,10 +112,30 @@ public class MatchmakingControllerTests
             HttpContext = new DefaultHttpContext()
         };
 
-        var result = await controller.WaitForMatch();
+        Task<IActionResult> firstResultTask = controller.WaitForMatch();
 
-        var badRequest = Assert.IsType<BadRequestObjectResult>(result);
-        Assert.Equal("Must be a websocket request", badRequest.Value);
+        controller.ControllerContext = new ControllerContext
+        {
+            HttpContext = new DefaultHttpContext()
+        };
+
+        IActionResult secondResult = await controller.WaitForMatch();
+        IActionResult firstResult = await firstResultTask;
+
+        var firstOk = Assert.IsType<OkObjectResult>(firstResult);
+        var secondOk = Assert.IsType<OkObjectResult>(secondResult);
+        Guid firstMatchId = ExtractMatchId(firstOk);
+        Guid secondMatchId = ExtractMatchId(secondOk);
+
+        Assert.NotEqual(Guid.Empty, firstMatchId);
+        Assert.Equal(firstMatchId, secondMatchId);
+    }
+
+    private static Guid ExtractMatchId(OkObjectResult response)
+    {
+        string json = JsonSerializer.Serialize(response.Value);
+        using JsonDocument document = JsonDocument.Parse(json);
+        return document.RootElement.GetProperty("id").GetGuid();
     }
 
     [Fact]
@@ -273,37 +308,44 @@ public class MatchBattleRuleTests
     }
 }
 
-internal sealed class FakeClosedWebSocket : WebSocket
+internal sealed class FakeOpenWebSocket : WebSocket
 {
+    private WebSocketState _state = WebSocketState.Open;
+
     public override WebSocketCloseStatus? CloseStatus => null;
 
     public override string? CloseStatusDescription => null;
 
-    public override WebSocketState State => WebSocketState.Closed;
+    public override WebSocketState State => _state;
 
     public override string? SubProtocol => null;
 
     public override void Abort()
     {
+        _state = WebSocketState.Aborted;
     }
 
     public override Task CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken)
     {
+        _state = WebSocketState.Closed;
         return Task.CompletedTask;
     }
 
     public override Task CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken)
     {
+        _state = WebSocketState.CloseSent;
         return Task.CompletedTask;
     }
 
     public override void Dispose()
     {
+        _state = WebSocketState.Closed;
     }
 
-    public override Task<WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken)
+    public override async Task<WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken)
     {
-        return Task.FromResult(new WebSocketReceiveResult(0, WebSocketMessageType.Binary, endOfMessage: true));
+        await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        throw new OperationCanceledException(cancellationToken);
     }
 
     public override Task SendAsync(ArraySegment<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken)
