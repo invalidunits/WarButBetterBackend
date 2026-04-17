@@ -199,7 +199,7 @@ public class MatchRoundHistorySerializationTests
                 new()
                 {
                     EventType = "three_choose_top_five",
-                    Description = "Player 1 chose index 2 from top-five and moved card 17 to top of deck (effect of captured 3).",
+                    Description = "Player 1 chose index 2 from top-five and added card 17 from top of deck to hand (effect of captured 3).",
                     SourcePlayer = 1,
                     TargetPlayers = new [] { 1 },
                     Data = new ()

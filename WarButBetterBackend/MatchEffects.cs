@@ -69,7 +69,7 @@ namespace WarButBetterBackend
             public ForceWinnerFirstEvent(Match match, RoundContext ctx)
             {
                 _match = match;
-                _winner = ctx.Winner;
+                _winner = ctx.Winner ?? throw new InvalidOperationException("ForceWinnerFirstEvent requires a winner.");
             }
 
             public Task RecieveUserChoice() => Task.CompletedTask;
@@ -106,14 +106,14 @@ namespace WarButBetterBackend
             public ChooseFromTopFiveEvent(Match match, RoundContext ctx)
             {
                 _match = match;
-                _player = ctx.Loser;
+                _player = ctx.Loser ?? throw new InvalidOperationException("ChooseFromTopFiveEvent requires a loser.");
                 _selectedIndex = 0;
             }
 
             public string DescribeEvent()
             {
                 string chosen = _chosenCard.HasValue ? ((int)_chosenCard.Value).ToString() : "none";
-                return $"Player {_player} moved card {chosen} to top of deck.";
+                return $"Player {_player} tooke card {chosen} from the top 5 of their deck.";
             }
 
             public async Task RecieveUserChoice()
@@ -190,8 +190,8 @@ namespace WarButBetterBackend
                     _chosenCard = chosen;
                     top.RemoveAt(pick);
 
-                    hand.Deck.Insert(0, chosen);
-                    hand.Deck.InsertRange(1, top);
+                    hand.Cards.Add(chosen);
+                    hand.Deck.InsertRange(0, top);
                 }
 
                 return Task.CompletedTask;
@@ -220,7 +220,7 @@ namespace WarButBetterBackend
             public ShuffleOpponentDeckEvent(Match match, RoundContext ctx)
             {
                 _match = match;
-                _opponent = ctx.Loser;
+                _opponent = ctx.Loser ?? throw new InvalidOperationException("ShuffleOpponentDeckEvent requires a loser.");
             }
 
             public Task RecieveUserChoice() => Task.CompletedTask;
@@ -261,8 +261,8 @@ namespace WarButBetterBackend
             public SwapHandCardEvent(Match match, RoundContext ctx)
             {
                 _match = match;
-                _winner = ctx.Winner;
-                _loser = ctx.Loser;
+                _winner = ctx.Winner ?? throw new InvalidOperationException("SwapHandCardEvent requires a winner.");
+                _loser = ctx.Loser ?? throw new InvalidOperationException("SwapHandCardEvent requires a loser.");
             }
 
             public Task RecieveUserChoice() => Task.CompletedTask;
@@ -316,7 +316,7 @@ namespace WarButBetterBackend
             public QueenGrabKingEvent(Match match, RoundContext ctx)
             {
                 _match = match;
-                _player = ctx.Loser;
+                _player = ctx.Loser ?? throw new InvalidOperationException("QueenGrabKingEvent requires a loser.");
             }
 
             public Task RecieveUserChoice() => Task.CompletedTask;

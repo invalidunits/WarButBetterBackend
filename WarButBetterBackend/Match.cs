@@ -58,23 +58,23 @@ namespace WarButBetterBackend
                 new(6,  EffectTrigger.WhenEither, OneUP: ctx =>
                     CardExtensions.GetSuite(ctx.myCard) == CardExtensions.GetSuite(ctx.theirCard)
                         ? ctx.bestOutcome
-                        : ctx.currentOutcome),
+                        : null),
 
                 new(7,  EffectTrigger.WhenEither, OneUP: ctx =>
                     CardExtensions.GetValue(ctx.theirCard) == 9
                         ? ctx.bestOutcome
-                        : ctx.currentOutcome),
+                        : null),
 
                 // 9 can be played as a 6.
                 new(9,  EffectTrigger.WhenEither, OneUP: ctx =>
                     (CardExtensions.GetSuite(ctx.myCard) == CardExtensions.GetSuite(ctx.theirCard))
                         ? ctx.bestOutcome
-                        : ctx.currentOutcome),
+                        : null),
 
                 new(11, EffectTrigger.WhenEither, OneUP: ctx =>
                     ctx.WarMode && CardExtensions.GetValue(ctx.theirCard) != (int)CardExtensions.SpecialValues.Jack
                         ? ctx.bestOutcome
-                        : ctx.currentOutcome),
+                        : null),
 
                 new(14, EffectTrigger.WhenEither, OneUP: ctx => ctx.bestOutcome),
             ];
@@ -216,6 +216,9 @@ namespace WarButBetterBackend
                         firstPlayer,
                     });
 
+                    // Resolve forced-deck turns immediately so clients with empty hands cannot softlock the turn.
+                    await AutoResolveForcedDeckTurns();
+
                     Card[] played = await WaitForTurns();
                     var ctx = new RoundContext
                     {
@@ -227,38 +230,51 @@ namespace WarButBetterBackend
                     };
 
                     RoundResult roundWinner = ResolveBattle(played[0], played[1], ctx.Pile);
-                    ctx.OutcomeCode = (int)roundWinner;
-                    if (roundWinner == RoundResult.WarTie)
+                    int preRoundWinner = roundWinner switch
                     {
-                        FinalizeRoundContext(ctx);
-                        await EndGame(RoundResult.WarTie, "war-tie");
-                        break;
+                        RoundResult.Player0Capture => 0,
+                        RoundResult.Player1Capture => 1,
+                        _ => -1,
+                    };
+                    await Broadcast(new {
+                        type = "preroundresult",
+                        played = played.Select(x => (int)x).ToArray(),
+                        turn = Turn,
+                        winner = preRoundWinner,
+                    });
+
+                    ctx.OutcomeCode = (int)roundWinner;
+                    if (roundWinner == RoundResult.Tie)
+                    {
+                        (roundWinner, Card[] warPlayed) = await ResolveWar(ctx.Pile);
+                        ctx.Played = warPlayed;
+                        ctx.OutcomeCode = (int)roundWinner;
                     }
 
+                    AddTurnEvents(ctx);
                     if (roundWinner == RoundResult.JokerBurn)
                     {
+                        ctx.Winner = null;
                         BurnCards(ctx.Pile);
-                        FinalizeRoundContext(ctx);
-                        await Broadcast(new {
-                            type = "jokerBurn",
-                            turn = Turn,
-                            burned = ctx.Pile.Select(c => (int)c).ToArray(),
-                            remaining = _Players.Select(p => p.hand.Cards.Count + p.hand.Deck.Count).ToArray(),
-                            round = ctx,
-                            history = GetRoundHistory(),
-                        });
-                        continue;
+                    }
+                    else if (roundWinner == RoundResult.WarTie)
+                    {
+                        ctx.Winner = null;
+                    }
+                    else
+                    {
+                        ctx.Winner = roundWinner == RoundResult.Player0Capture ? 0 : 1;
+                        ctx.EffectsDisabled = CardExtensions.GetValue(played[0]) == 10
+                                        || CardExtensions.GetValue(played[1]) == 10;
                     }
 
-                    ctx.Winner = roundWinner == RoundResult.Player0Capture ? 0 : 1;
-                    ctx.EffectsDisabled = CardExtensions.GetValue(played[0]) == 10
-                                       || CardExtensions.GetValue(played[1]) == 10;
-                    AddTurnEvents(ctx);
                     QueueCardEffects(ctx);
                     await ApplyQueuedEffects(ctx);
-                    CollectCards(ctx.Winner, ctx.Pile);
+                    if (ctx.Winner is int winner)
+                    {
+                        CollectCards(winner, ctx.Pile);
+                    }
                     FinalizeRoundContext(ctx);
-
                     await Broadcast(new {
                         type = "roundResult",
                         turn = Turn,
@@ -268,9 +284,15 @@ namespace WarButBetterBackend
                         round = ctx,
                         history = GetRoundHistory(),
                     });
+
+                    if (roundWinner == RoundResult.WarTie) await EndGame(RoundResult.WarTie, "war-tie");
                 }
             }
             catch (OperationCanceledException) {}
+            catch (Exception except)
+            {
+                Console.WriteLine(except);
+            }
             finally
             {
                 lock (this)
@@ -297,7 +319,10 @@ namespace WarButBetterBackend
                     byte[] payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new {
                         type="hand",
                         hand=Convert.ToBase64String(_Players[i].hand.Cards.ToArray()),
+                        handlen=_Players[i].hand.Cards.Count,
+                        opponentHandLen=_Players[1 - i].hand.Cards.Count,
                         decklen=_Players[i].hand.Deck.Count,
+                        opponentDeckLen=_Players[1 - i].hand.Cards.Count,
                         turn=Turn,
                         player=i,
                     }));
@@ -401,10 +426,74 @@ namespace WarButBetterBackend
             }
         }
 
-        public void RecieveWarTurn(int player, byte[] playedCards)
+        public void RecieveWarTurn(int player, byte[] selectedCards)
         {
-            _ = player;
-            _ = playedCards;
+            List<object> progressNotifications = [];
+            lock (this)
+            {
+                if (_pendingWarTurns is null || _pendingWarTurns[player].Task.IsCompleted)
+                    return;
+
+                if (_pendingWarSelections is null || _pendingWarSelectionTargets is null)
+                    return;
+
+                Hand hand = _Players[player].hand;
+                List<Card> selected = _pendingWarSelections[player];
+                int targetSelections = _pendingWarSelectionTargets[player];
+
+                foreach (byte card in selectedCards)
+                {
+                    if (selected.Count >= targetSelections)
+                    {
+                        break;
+                    }
+
+                    int idx = hand.Cards.IndexOf(card);
+                    if (idx < 0) return;
+
+                    hand.Cards.RemoveAt(idx);
+                    selected.Add(card);
+
+                    // Sacrifices (not the final war card) are revealed immediately.
+                    // The war card (last hand selection) stays hidden until warReveal.
+                    bool isSacrifice = selected.Count < targetSelections;
+                    progressNotifications.Add(new
+                    {
+                        type = "warProgress",
+                        turn = Turn,
+                        player,
+                        slot = selected.Count - 1,
+                        count = selected.Count,
+                        required = targetSelections,
+                        card = isSacrifice ? (int?)card : null,
+                    });
+                }
+
+                if (selected.Count < targetSelections)
+                {
+                    // Not enough user selections yet; keep waiting for more partial submissions.
+                    goto SendProgress;
+                }
+
+                List<Card> chosen = [.. selected];
+                int remaining = 4 - chosen.Count;
+                for (int i = 0; i < remaining; i++)
+                {
+                    if (!TryDrawCard(player, out Card deckCard)) return;
+                    int insertAt = chosen.Count > 0 ? chosen.Count - 1 : chosen.Count;
+                    chosen.Insert(insertAt, deckCard);
+                }
+
+                if (chosen.Count != 4) return;
+
+                _pendingWarTurns[player].TrySetResult([.. chosen]);
+            }
+
+        SendProgress:
+            foreach (object payload in progressNotifications)
+            {
+                _ = SendToPlayer(1 - player, payload);
+            }
         }
 
         public async Task RecieveData(ClientSession client, ReadOnlyMemory<byte> data, WebSocketReceiveResult result)
@@ -433,49 +522,86 @@ namespace WarButBetterBackend
             }
 
             string? type = typeNode.GetString();
+            int? playerIndex = null;
             for (int i = 0; i < _Players.Length; i++)
             {
                 if (_Players[i].client == client)
                 {
-                    if (string.Equals(type, "effectChoice", StringComparison.OrdinalIgnoreCase))
-                    {
-                        lock (this)
-                        {
-                            if (_pendingTopFiveChoice is not null
-                                && _pendingTopFiveChoicePlayer == i
-                                && root.TryGetProperty("choice", out JsonElement choiceNode)
-                                && choiceNode.TryGetInt32(out int choiceIndex)
-                                && choiceIndex >= 0
-                                && choiceIndex < _pendingTopFiveChoiceCount)
-                            {
-                                _pendingTopFiveChoice.TrySetResult(choiceIndex);
-                            }
-                        }
-                    }
-                    else if (string.Equals(type, "turn", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (root.TryGetProperty("card", out JsonElement cardValue) && cardValue.TryGetByte(out byte playedCard))
-                        {
-                            await RecieveTurn(i, playedCard);
-                        }
-                        else if (root.TryGetProperty("cardIndex", out JsonElement cardIndex) && cardIndex.TryGetInt32(out int index))
-                        {
-                            byte selectedCard;
-                            lock (this)
-                            {
-                                if (index < 0 || index >= _Players[i].hand.Cards.Count)
-                                {
-                                    break;
-                                }
-
-                                selectedCard = _Players[i].hand.Cards[index];
-                            }
-
-                            await RecieveTurn(i, selectedCard);
-                        }
-                    }
-
+                    playerIndex = i;
                     break;
+                }
+            }
+
+            if (string.Equals(type, "meta", StringComparison.OrdinalIgnoreCase))
+            {
+                JsonElement metadata = root.TryGetProperty("data", out JsonElement metadataNode)
+                    ? metadataNode.Clone()
+                    : root.Clone();
+                await Broadcast(new {
+                    type = "meta",
+                    from = new {
+                        player = playerIndex,
+                        spectate = !playerIndex.HasValue,
+                    },
+                    data = metadata,
+                });
+                return;
+            }
+
+            if (!playerIndex.HasValue)
+            {
+                return;
+            }
+
+            int player = playerIndex.Value;
+            if (string.Equals(type, "effectChoice", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (this)
+                {
+                    if (_pendingTopFiveChoice is not null
+                        && _pendingTopFiveChoicePlayer == player
+                        && root.TryGetProperty("choice", out JsonElement choiceNode)
+                        && choiceNode.TryGetInt32(out int choiceIndex)
+                        && choiceIndex >= 0
+                        && choiceIndex < _pendingTopFiveChoiceCount)
+                    {
+                        _pendingTopFiveChoice.TrySetResult(choiceIndex);
+                    }
+                }
+            }
+            else if (string.Equals(type, "warTurn", StringComparison.OrdinalIgnoreCase))
+            {
+                if (root.TryGetProperty("cards", out JsonElement warCardsNode)
+                    && warCardsNode.ValueKind == JsonValueKind.Array)
+                {
+                    List<byte> cards = [];
+                    foreach (JsonElement el in warCardsNode.EnumerateArray())
+                    {
+                        if (el.TryGetByte(out byte c)) cards.Add(c);
+                    }
+                    RecieveWarTurn(player, [.. cards]);
+                }
+            }
+            else if (string.Equals(type, "turn", StringComparison.OrdinalIgnoreCase))
+            {
+                if (root.TryGetProperty("card", out JsonElement cardValue) && cardValue.TryGetByte(out byte playedCard))
+                {
+                    await RecieveTurn(player, playedCard);
+                }
+                else if (root.TryGetProperty("cardIndex", out JsonElement cardIndex) && cardIndex.TryGetInt32(out int index))
+                {
+                    byte selectedCard;
+                    lock (this)
+                    {
+                        if (index < 0 || index >= _Players[player].hand.Cards.Count)
+                        {
+                            return;
+                        }
+
+                        selectedCard = _Players[player].hand.Cards[index];
+                    }
+
+                    await RecieveTurn(player, selectedCard);
                 }
             }
         }
@@ -519,6 +645,44 @@ namespace WarButBetterBackend
             return cards;
         }
 
+        private async Task AutoResolveForcedDeckTurns()
+        {
+            int[] order;
+            lock (this)
+            {
+                if (State != MatchState.RunningGame || _pendingTurns is null)
+                {
+                    return;
+                }
+
+                if (_firstPlayerThisTurn is int firstPlayer)
+                {
+                    order = [firstPlayer, 1 - firstPlayer];
+                }
+                else
+                {
+                    order = [0, 1];
+                }
+            }
+
+            foreach (int player in order)
+            {
+                bool shouldAutoPlay;
+                lock (this)
+                {
+                    shouldAutoPlay = State == MatchState.RunningGame
+                        && _pendingTurns is not null
+                        && _forceDeckPlayNextTurn[player]
+                        && !_pendingTurns[player].Task.IsCompleted;
+                }
+
+                if (shouldAutoPlay)
+                {
+                    await RecieveTurn(player, 0);
+                }
+            }
+        }
+
         private RoundResult? EvaluateImmediateOutcome()
         {
             lock (this)
@@ -554,60 +718,89 @@ namespace WarButBetterBackend
         private RoundResult ResolveBattle(Card first, Card second, List<Card> pile)
         {
             RoundResult winner = DetermineWinner(first, second, warMode: false);
-            if (winner != RoundResult.Tie)
-            {
-                return winner;
-            }
-
-            return ResolveWar(pile);
+            return winner;
         }
 
-        private RoundResult ResolveWar(List<Card> pile)
+        private async Task<(RoundResult Result, Card[] Played)> ResolveWar(List<Card> pile)
         {
             while (true)
             {
-                Card[] topCards = new Card[_Players.Length];
+                bool p0CanWar = CanDrawCards(0, 4);
+                bool p1CanWar = CanDrawCards(1, 4);
+
+                if (!p0CanWar && !p1CanWar) return (RoundResult.WarTie, [0, 0]);
+                if (!p0CanWar) return (RoundResult.Player1Capture, [0, 0]);
+                if (!p1CanWar) return (RoundResult.Player0Capture, [0, 0]);
 
                 lock (this)
                 {
-                    bool p0CanWar = CanDrawCards(0, 4);
-                    bool p1CanWar = CanDrawCards(1, 4);
-                    if (!p0CanWar && !p1CanWar)
-                    {
-                        return RoundResult.WarTie;
-                    }
+                    _pendingWarTurns =
+                    [
+                        new(TaskCreationOptions.RunContinuationsAsynchronously),
+                        new(TaskCreationOptions.RunContinuationsAsynchronously),
+                    ];
 
-                    if (!p0CanWar)
-                    {
-                        return RoundResult.Player1Capture;
-                    }
+                    _pendingWarSelections =
+                    [
+                        [],
+                        [],
+                    ];
 
-                    if (!p1CanWar)
-                    {
-                        return RoundResult.Player0Capture;
-                    }
+                    _pendingWarSelectionTargets =
+                    [
+                        Math.Min(4, _Players[0].hand.Cards.Count),
+                        Math.Min(4, _Players[1].hand.Cards.Count),
+                    ];
 
-                    for (int i = 0; i < 4; i++)
+                    for (int player = 0; player < 2; player++)
                     {
-                        TryDrawCard(0, out Card p0Card);
-                        TryDrawCard(1, out Card p1Card);
-                        pile.Add(p0Card);
-                        pile.Add(p1Card);
-                        if (i == 3)
+                        if (_pendingWarSelectionTargets[player] == 0)
                         {
-                            topCards[0] = p0Card;
-                            topCards[1] = p1Card;
+                            RecieveWarTurn(player, []);
                         }
                     }
                 }
 
-                RoundResult winner = DetermineWinner(topCards[0], topCards[1], warMode: true);
-                if (winner == RoundResult.Tie)
+                await SendHandStates();
+                await Broadcast(new { type = "requestWarTurn", turn = Turn });
+
+                Task<Card[]>[] waits;
+                lock (this)
                 {
-                    continue;
+                    waits = [_pendingWarTurns[0].Task, _pendingWarTurns[1].Task];
                 }
 
-                return winner;
+                Card[][] selections = await Task.WhenAll(waits).WaitAsync(cancellationSource.Token);
+
+                lock (this)
+                {
+                    _pendingWarTurns = null;
+                    _pendingWarSelections = null;
+                    _pendingWarSelectionTargets = null;
+                }
+
+                // selections[player] = [sacrifice0, sacrifice1, sacrifice2, warCard]
+                Card[] warCards = new Card[2];
+                for (int player = 0; player < 2; player++)
+                {
+                    for (int i = 0; i < 3; i++) pile.Add(selections[player][i]);
+                    warCards[player] = selections[player][3];
+                    pile.Add(warCards[player]);
+                }
+
+                // Both players have finished — reveal both war cards simultaneously.
+                await Broadcast(new {
+                    type = "warReveal",
+                    turn = Turn,
+                    cards = warCards.Select(c => (int)c).ToArray(),
+                });
+
+                RoundResult result = DetermineWinner(warCards[0], warCards[1], warMode: true);
+
+                if (result == RoundResult.JokerBurn) return (RoundResult.JokerBurn, warCards);
+                if (result != RoundResult.Tie) return (result, warCards);
+
+                // Another tie — loop for another war round
             }
         }
 
@@ -631,12 +824,14 @@ namespace WarButBetterBackend
             {
                 myCard = player0Card,
                 theirCard = player1Card,
-                currentOutcome = result,
+                valueOutcome = result,
                 bestOutcome = RoundResult.Player0Capture,
                 worstOutcome = RoundResult.Player1Capture,
                 WarMode = warMode,
             };
 
+            RoundResult? P0oneUP = null;
+            RoundResult? P1oneUP = null;
             foreach (CardDetails detail in _cardDetails)
             {
                 if (detail.OneUP is null)
@@ -648,24 +843,25 @@ namespace WarButBetterBackend
                 {
                     oneUPContext.myCard = player0Card;
                     oneUPContext.theirCard = player1Card;
-                    oneUPContext.currentOutcome = result;
+                    oneUPContext.valueOutcome = result;
                     oneUPContext.bestOutcome = RoundResult.Player0Capture;
                     oneUPContext.worstOutcome = RoundResult.Player1Capture;
-                    result = detail.OneUP(oneUPContext);
+                    P0oneUP = detail.OneUP(oneUPContext) ?? P0oneUP;
                 }
 
                 if (p1 == detail.CardValue)
                 {
                     oneUPContext.myCard = player1Card;
                     oneUPContext.theirCard = player0Card;
-                    oneUPContext.currentOutcome = result;
+                    oneUPContext.valueOutcome = result;
                     oneUPContext.bestOutcome = RoundResult.Player1Capture;
                     oneUPContext.worstOutcome = RoundResult.Player0Capture;
-                    result = detail.OneUP(oneUPContext);
+                    P1oneUP = detail.OneUP(oneUPContext) ?? P0oneUP;
                 }
             }
 
-            return result;
+            if (P0oneUP != P1oneUP && P0oneUP != null && P1oneUP != null) return RoundResult.Tie;
+            return P0oneUP ?? P1oneUP ?? result;
         }
 
         private void QueueCardEffects(RoundContext ctx)
@@ -690,10 +886,10 @@ namespace WarButBetterBackend
 
                 bool applies = detail.Trigger switch
                 {
-                    EffectTrigger.WhenWinner => ctx.WinnerCardValue == detail.CardValue,
-                    EffectTrigger.WhenLoser  => ctx.LoserCardValue  == detail.CardValue,
-                    EffectTrigger.WhenEither => ctx.WinnerCardValue == detail.CardValue
-                                            || ctx.LoserCardValue  == detail.CardValue,
+                    EffectTrigger.WhenWinner => ctx.WinnerCardValue is int winnerValue && winnerValue == detail.CardValue,
+                    EffectTrigger.WhenLoser  => ctx.LoserCardValue  is int loserValue && loserValue == detail.CardValue,
+                    EffectTrigger.WhenEither => (ctx.WinnerCardValue is int eitherWinnerValue && eitherWinnerValue == detail.CardValue)
+                                            || (ctx.LoserCardValue  is int eitherLoserValue  && eitherLoserValue == detail.CardValue),
                     _ => false,
                 };
 
@@ -713,7 +909,7 @@ namespace WarButBetterBackend
                     {
                         EffectTrigger.WhenWinner => forcedPlayer,
                         EffectTrigger.WhenLoser => 1 - forcedPlayer,
-                        _ => ctx.Winner,
+                        _ => ctx.Winner ?? forcedPlayer,
                     };
 
                     effectCtx = CloneRoundContextWithWinner(ctx, forcedWinner);
@@ -883,6 +1079,9 @@ namespace WarButBetterBackend
         private readonly List<Card> _burnedCards = [];
         private readonly List<RoundContext> _roundHistory = [];
         private readonly CardDetails[] _cardDetails;
+        private TaskCompletionSource<Card[]>[]? _pendingWarTurns;
+        private List<Card>[]? _pendingWarSelections;
+        private int[]? _pendingWarSelectionTargets;
 
 
         private enum RoundResult 
@@ -910,10 +1109,10 @@ namespace WarButBetterBackend
             [JsonInclude] public required List<RoundEventSnapshot> AppliedEvents;
             [JsonInclude] public bool EffectsDisabled;
             [JsonInclude] public int OutcomeCode;
-            [JsonInclude] public int Winner;
-            public int Loser => 1 - Winner;
-            public int WinnerCardValue => CardExtensions.GetValue(Played[Winner]);
-            public int LoserCardValue  => CardExtensions.GetValue(Played[Loser]);
+            [JsonInclude] public int? Winner;
+            public int? Loser => Winner.HasValue ? 1 - Winner.Value : null;
+            public int? WinnerCardValue => Winner.HasValue ? CardExtensions.GetValue(Played[Winner.Value]) : null;
+            public int? LoserCardValue  => Loser.HasValue ? CardExtensions.GetValue(Played[Loser.Value]) : null;
             [JsonInclude] public int[] RemainingCards = [0, 0];
             [JsonInclude] public int BurnedCardsTotal;
         }
@@ -939,14 +1138,14 @@ namespace WarButBetterBackend
             int CardValue,
             EffectTrigger Trigger,
             Func<RoundContext, IRoundEvent?>? CreateEvent = null,
-            Func<OneUPContext, RoundResult>? OneUP = null
+            Func<OneUPContext, RoundResult?>? OneUP = null
         );
 
         private struct OneUPContext
         {
             public Card myCard;
             public Card theirCard;
-            public RoundResult currentOutcome;
+            public RoundResult valueOutcome;
             public RoundResult bestOutcome;
             public RoundResult worstOutcome;
             public bool WarMode;
