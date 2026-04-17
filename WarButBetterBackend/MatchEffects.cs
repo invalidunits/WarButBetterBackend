@@ -30,7 +30,7 @@ namespace WarButBetterBackend
             public Task ApplyEvent()
             {
                 Card joker = CardExtensions.GetCard(CardExtensions.Suite.Jester, 0);
-                double chance = Math.Min(0.20, 0.05 + (_context.Turn - 1) * 0.01);
+                double chance = 0.5; // Math.Min(0.20, 0.05 + (_context.Turn - 1) * 0.01);
                 lock (_match)
                 {
                     for (int i = 0; i < _match._Players.Length; i++)

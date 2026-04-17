@@ -157,7 +157,7 @@ namespace WarButBetterBackend
                 // Begin Round.
                 Card[] TotalDeck = CardExtensions.Standard52Deck.ToArray();
                 Random.Shared.Shuffle(TotalDeck);
-
+                Array.Resize(ref TotalDeck, 25);
 
                 lock (this)
                 {
@@ -247,6 +247,7 @@ namespace WarButBetterBackend
                     if (roundWinner == RoundResult.Tie)
                     {
                         (roundWinner, Card[] warPlayed) = await ResolveWar(ctx.Pile);
+                        if (cancellationSource.Token.IsCancellationRequested) break;
                         ctx.Played = warPlayed;
                         ctx.OutcomeCode = (int)roundWinner;
                     }
@@ -285,7 +286,11 @@ namespace WarButBetterBackend
                         history = GetRoundHistory(),
                     });
 
-                    if (roundWinner == RoundResult.WarTie) await EndGame(RoundResult.WarTie, "war-tie");
+                    if (roundWinner == RoundResult.WarTie) 
+                    {
+                        await EndGame(RoundResult.WarTie, "war-tie");
+                        break;
+                    }
                 }
             }
             catch (OperationCanceledException) {}
@@ -492,7 +497,7 @@ namespace WarButBetterBackend
         SendProgress:
             foreach (object payload in progressNotifications)
             {
-                _ = SendToPlayer(1 - player, payload);
+                Broadcast(payload);
             }
         }
 
@@ -727,10 +732,24 @@ namespace WarButBetterBackend
             {
                 bool p0CanWar = CanDrawCards(0, 4);
                 bool p1CanWar = CanDrawCards(1, 4);
+                for (int i = 0; i < _Players.Length; i++)
+                {
+                    _Players[i].hand.FillHand();
+                }
 
                 if (!p0CanWar && !p1CanWar) return (RoundResult.WarTie, [0, 0]);
-                if (!p0CanWar) return (RoundResult.Player1Capture, [0, 0]);
-                if (!p1CanWar) return (RoundResult.Player0Capture, [0, 0]);
+
+                if (!p0CanWar) 
+                {
+                    await EndGame(RoundResult.Player1Capture, "deck-exhausted");
+                    return (RoundResult.Player1Capture, [0, 0]);
+                }
+
+                if (!p1CanWar) 
+                {
+                    await EndGame(RoundResult.Player0Capture, "deck-exhausted");
+                    return (RoundResult.Player0Capture, [0, 0]);
+                }
 
                 lock (this)
                 {
