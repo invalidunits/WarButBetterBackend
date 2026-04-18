@@ -10,7 +10,6 @@
   const statusBadge = document.getElementById("statusBadge");
   const statusText = document.getElementById("statusText");
   const gameFrame = document.getElementById("gameFrame");
-  const embedUnavailable = document.getElementById("embedUnavailable");
 
   let currentMatchId = null;
   let statusPollHandle = null;
@@ -70,6 +69,17 @@
     window.history.replaceState({}, "", browserUrl);
   }
 
+  function clearCurrentMatch() {
+    currentMatchId = null;
+    matchIdInput.value = "";
+    inviteLinkInput.value = "";
+    shareSection.classList.add("hidden");
+
+    const browserUrl = new URL(window.location.href);
+    browserUrl.searchParams.delete("match");
+    window.history.replaceState({}, "", browserUrl);
+  }
+
   async function callJson(url, options) {
     const response = await fetch(url, options);
     if (!response.ok) {
@@ -80,16 +90,23 @@
     return text ? JSON.parse(text) : null;
   }
 
-  async function loadEmbeddedGame(matchId) {
+  async function loadEmbeddedGame(matchId, queueMode = false) {
     const backendUrl = `${window.location.protocol}//${window.location.host}`;
     const src = buildGameIndexUrl();
-    src.searchParams.set("match", matchId);
+    if (matchId) {
+      src.searchParams.set("match", matchId);
+    } else {
+      src.searchParams.delete("match");
+    }
+    if (queueMode) {
+      src.searchParams.set("queue", "1");
+    } else {
+      src.searchParams.delete("queue");
+    }
     src.searchParams.set("backend", backendUrl);
-    console.log(backendUrl)
 
     gameFrame.src = src.toString();
     gameFrame.classList.remove("hidden");
-    embedUnavailable.classList.add("hidden");
   }
 
   async function refreshMatchStatus(matchId) {
@@ -144,18 +161,16 @@
   }
 
   async function queueForMatch() {
-    setStatus("idle", "Queueing for random match...");
+    setStatus("idle", "Opening game queue...");
     try {
-      const data = await callJson("/match", { method: "GET" });
-      if (!data || !data.id || !validGuid(String(data.id))) {
-        throw new Error("Queue response missing match id");
+      if (statusPollHandle !== null) {
+        window.clearInterval(statusPollHandle);
+        statusPollHandle = null;
       }
 
-      const id = String(data.id);
-      setCurrentMatch(id);
-      await loadEmbeddedGame(id);
-      startStatusPolling(id);
-      setStatus("waiting", "Matched. Waiting for game state updates...");
+      clearCurrentMatch();
+      await loadEmbeddedGame(null, true);
+      setStatus("waiting", "Game opened in queue mode. Waiting now happens in-game.");
     } catch (error) {
       setStatus("error", `Queue failed: ${error.message}`);
     }
