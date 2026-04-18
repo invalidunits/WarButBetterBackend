@@ -1,0 +1,218 @@
+@import url("https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700;900&family=EB+Garamond:wght@400;500;700&display=swap");
+
+:root {
+  --bg-top: #080708;
+  --bg-bottom: #131014;
+  --panel: rgba(10, 8, 11, 0.84);
+  --panel-border: rgba(186, 170, 142, 0.28);
+  --text: #ece2ce;
+  --muted: #b3a88f;
+  --accent: #8e1e23;
+  --accent-2: #5f121a;
+  --danger: #a81824;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "EB Garamond", Georgia, serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 50% -20%, rgba(177, 138, 83, 0.16), transparent 45%),
+    radial-gradient(circle at 80% 20%, rgba(99, 21, 28, 0.18), transparent 30%),
+    linear-gradient(180deg, var(--bg-top), var(--bg-bottom));
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.35;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(255, 255, 255, 0.012),
+      rgba(255, 255, 255, 0.012) 1px,
+      transparent 1px,
+      transparent 4px
+    );
+}
+
+.page {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  gap: 16px;
+  padding: 16px;
+  min-height: 100vh;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  backdrop-filter: blur(8px);
+  box-shadow: inset 0 0 0 1px rgba(49, 39, 27, 0.2), 0 16px 40px rgba(0, 0, 0, 0.45);
+}
+
+.controls-panel {
+  padding: 18px;
+}
+
+.controls-panel h1 {
+  margin: 0;
+  font-family: "Cinzel", "Times New Roman", serif;
+  font-size: 36px;
+  font-weight: 900;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: #f2dfbc;
+  text-shadow: 0 0 14px rgba(184, 138, 57, 0.22);
+}
+
+.subtitle {
+  margin-top: 6px;
+  margin-bottom: 16px;
+  color: var(--muted);
+}
+
+.actions,
+.join-row,
+.share-row {
+  display: flex;
+  gap: 8px;
+}
+
+.actions {
+  margin-bottom: 10px;
+}
+
+.join-row,
+.share {
+  margin-bottom: 12px;
+}
+
+button,
+input {
+  border-radius: 10px;
+  border: 1px solid rgba(188, 168, 132, 0.3);
+  background: rgba(27, 20, 25, 0.72);
+  color: var(--text);
+  padding: 10px 12px;
+  font-size: 18px;
+}
+
+button {
+  cursor: pointer;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border: 1px solid rgba(207, 164, 103, 0.35);
+  font-weight: 600;
+  font-family: "Cinzel", "Times New Roman", serif;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+button.secondary {
+  background: linear-gradient(135deg, #2b0f14, #4b1620);
+}
+
+button:hover {
+  filter: brightness(1.09);
+  transform: translateY(-1px);
+}
+
+button:active {
+  transform: translateY(0);
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+input {
+  width: 100%;
+}
+
+.share label {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 6px;
+  color: var(--muted);
+}
+
+.status-badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.status-idle {
+  background: rgba(189, 176, 149, 0.2);
+}
+
+.status-waiting {
+  background: rgba(184, 138, 57, 0.24);
+}
+
+.status-running,
+.status-full {
+  background: rgba(153, 36, 45, 0.24);
+}
+
+.status-error {
+  background: rgba(239, 68, 68, 0.25);
+}
+
+.status-text {
+  margin: 0;
+  color: var(--text);
+}
+
+.game-panel {
+  overflow: hidden;
+  min-height: calc(100vh - 32px);
+  position: relative;
+}
+
+.embed-unavailable {
+  padding: 18px;
+  color: var(--muted);
+}
+
+.embed-unavailable h2 {
+  margin-top: 0;
+  color: var(--text);
+}
+
+.game-frame {
+  width: 100%;
+  height: calc(100vh - 32px);
+  border: 0;
+  background: #000;
+}
+
+.hidden {
+  display: none;
+}
+
+@media (max-width: 980px) {
+  .page {
+    grid-template-columns: 1fr;
+  }
+
+  .game-panel,
+  .game-frame {
+    min-height: 60vh;
+    height: 60vh;
+  }
+}

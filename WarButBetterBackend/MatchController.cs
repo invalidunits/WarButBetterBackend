@@ -31,6 +31,33 @@ namespace WarButBetterBackend
             }
         }
 
+        [HttpGet("{matchID}/status")]
+        public IActionResult GetMatchStatus(Guid matchID)
+        {
+            Match? match;
+            lock (_matches)
+            {
+                if (!_matches.TryGetValue(matchID, out match))
+                {
+                    return NotFound();
+                }
+            }
+
+            Match.MatchState state = match.State;
+            int connectedPlayers = match.ConnectedPlayerCount;
+            bool canJoinAsPlayer = state == Match.MatchState.WaitingForPlayers && connectedPlayers < 2;
+
+            return Ok(new
+            {
+                id = match.Id,
+                state,
+                connectedPlayers,
+                maxPlayers = 2,
+                createdAt = match.CreatedAt,
+                canJoinAsPlayer,
+            });
+        }
+
     
         [HttpGet]
         public async Task<IActionResult> WaitForMatch()

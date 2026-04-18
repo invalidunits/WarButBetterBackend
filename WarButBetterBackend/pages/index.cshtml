@@ -1,0 +1,53 @@
+@page
+@{
+	Layout = null;
+}
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Joker</title>
+	<link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+	<main class="page">
+		<section class="panel controls-panel">
+			<h1>Joker</h1>
+			<p class="subtitle">Create a match, share the link, and play in your browser.</p>
+
+			<div class="actions">
+				<button id="createMatchBtn" type="button">Create Private Match</button>
+				<button id="queueMatchBtn" type="button" class="secondary">Find Match (Queue)</button>
+			</div>
+
+			<div class="join-row">
+				<input id="matchIdInput" type="text" placeholder="Paste match ID" autocomplete="off" />
+				<button id="joinMatchBtn" type="button" class="secondary">Join</button>
+			</div>
+
+			<div id="shareSection" class="share hidden">
+				<label for="inviteLinkInput">Invite Link</label>
+				<div class="share-row">
+					<input id="inviteLinkInput" type="text" readonly />
+					<button id="copyLinkBtn" type="button">Copy</button>
+					<button id="nativeShareBtn" type="button" class="secondary">Share</button>
+				</div>
+			</div>
+
+			<div id="statusBadge" class="status-badge status-idle">Idle</div>
+			<p id="statusText" class="status-text">Create a private match or queue for a random one.</p>
+		</section>
+
+		<section class="panel game-panel">
+			<div id="embedUnavailable" class="embed-unavailable">
+				<h2>Game Embed Not Found</h2>
+				<p>Export the Godot web build to <code>wwwroot/game</code> (expecting <code>/game/index.html</code>), then reload this page.</p>
+			</div>
+			<iframe id="gameFrame" class="game-frame hidden" title="War But Better Game" allow="fullscreen" loading="eager"></iframe>
+		</section>
+	</main>
+
+	<script src="/app.js" defer></script>
+</body>
+</html>
