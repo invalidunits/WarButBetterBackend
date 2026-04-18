@@ -8,7 +8,6 @@ namespace WarButBetterBackend
         public static void Main(String[] args)
         {
             var builder = WebApplication.CreateBuilder(args);
-            builder.WebHost.UseUrls("http://localhost:8080");
             builder.Services.AddRazorPages();
             builder.Services.AddControllers();
             builder.Services.AddHostedService<MatchmakingController.MatchCleanupService>();
